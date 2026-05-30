@@ -113,6 +113,8 @@ Material :: struct {
     sampled_albedo: Sampled_Spectrum = .{0.8, 0.8, 0.8, 0.8};
     emission: Vector3;
     sampled_emission: Sampled_Spectrum;
+    reflectance_texture_index: int = -1;
+    normalmap_texture_index: int = -1;
     inside_medium_index: int = -1;
     outside_medium_index: int = -1;
 }
@@ -123,11 +125,38 @@ Sphere :: struct {
     material_index: int;
 }
 
+Point_Spot_Light :: struct {
+    position: Vector3;
+    direction: Vector3 = .{0, 0, -1};
+    intensity: Vector3 = .{1, 1, 1};
+    sampled_intensity: Sampled_Spectrum = .{1, 1, 1, 1};
+    cos_total_width: float = -1.0;
+    cos_falloff_start: float = -1.0;
+    is_spot: bool;
+}
+
+Triangle_Mesh :: struct {
+    positions: [] Vector3;
+    normals: [] Vector3;
+    texcoords: [] Vector2;
+    indices: [] int;
+    material_index: int;
+}
+
+Image_Texture :: struct {
+    name: string;
+    filename: string;
+    width, height: int;
+    pixels: [] u8;
+    scale: Vector3 = .{1, 1, 1};
+}
+
 Surface_Interaction :: struct {
     p: Vector3; 
     p_error: Vector3;
     n: Vector3;
     dpdu: Vector3;
+    uv: Point2;
     material_index: int;
 }
 
@@ -142,10 +171,33 @@ Interval :: struct {
 
 Scene :: struct {
     spheres: [..] Sphere;
+    point_spot_lights: [..] Point_Spot_Light;
+    triangle_meshes: [..] Triangle_Mesh;
+    textures: [..] Image_Texture;
     materials: [..] Material;
     media: [..] Medium;
     infinite_light: Vector3 = .{0.02, 0.025, 0.04};
     sampled_infinite_light: Sampled_Spectrum = .{0.02, 0.025, 0.04, 0.04};
+}
+
+free_scene :: (scene: *Scene) {
+    for *mesh: scene.triangle_meshes {
+        array_free(mesh.positions);
+        array_free(mesh.normals);
+        array_free(mesh.texcoords);
+        array_free(mesh.indices);
+    }
+    for *texture: scene.textures {
+        free(texture.name);
+        free(texture.filename);
+        array_free(texture.pixels);
+    }
+    array_free(scene.triangle_meshes);
+    array_free(scene.textures);
+    array_free(scene.spheres);
+    array_free(scene.point_spot_lights);
+    array_free(scene.materials);
+    array_free(scene.media);
 }
 
 Medium :: struct {
@@ -836,9 +888,100 @@ intersect_sphere :: (sphere: *Sphere, ray: Ray, t_max: float) -> hit: bool, si: 
             p_error,
             normalize(local_p),
             dpdu,
+            .{},
             sphere.material_index,
         },
     };
+}
+
+intersect_triangle_mesh :: (mesh: *Triangle_Mesh, ray: Ray, t_max: float) -> hit: bool, si: Shape_Intersection {
+    closest := t_max;
+    found := false;
+    closest_si: Shape_Intersection;
+
+    tri_count := mesh.indices.count / 3;
+    for tri: 0..tri_count - 1 {
+        i0 := mesh.indices[tri * 3 + 0];
+        i1 := mesh.indices[tri * 3 + 1];
+        i2 := mesh.indices[tri * 3 + 2];
+        if i0 < 0 || i1 < 0 || i2 < 0 continue;
+        if i0 >= mesh.positions.count || i1 >= mesh.positions.count || i2 >= mesh.positions.count continue;
+
+        p0 := mesh.positions[i0];
+        p1 := mesh.positions[i1];
+        p2 := mesh.positions[i2];
+        e1 := p1 - p0;
+        e2 := p2 - p0;
+        pvec := cross(ray.direction, e2);
+        det := dot(e1, pvec);
+        if abs(det) < cast(float) 1.0e-8 continue;
+
+        inv_det := 1.0 / det;
+        tvec := ray.origin - p0;
+        u := dot(tvec, pvec) * inv_det;
+        if u < 0.0 || u > 1.0 continue;
+
+        qvec := cross(tvec, e1);
+        v := dot(ray.direction, qvec) * inv_det;
+        if v < 0.0 || u + v > 1.0 continue;
+
+        t := dot(e2, qvec) * inv_det;
+        if t <= RAY_T_MIN || t >= closest continue;
+
+        n := normalize(cross(e1, e2));
+        if length(n) == 0.0 continue;
+        if dot(n, ray.direction) > 0.0 n = -n;
+
+        if mesh.normals.count == mesh.positions.count {
+            n0 := mesh.normals[i0];
+            n1 := mesh.normals[i1];
+            n2 := mesh.normals[i2];
+            ns := normalize((1.0 - u - v) * n0 + u * n1 + v * n2);
+            if length(ns) > 0.0 {
+                n = ns;
+                if dot(n, ray.direction) > 0.0 n = -n;
+            }
+        }
+
+        uv: Point2;
+        dpdu := e1;
+        if mesh.texcoords.count == mesh.positions.count {
+            uv0 := mesh.texcoords[i0];
+            uv1 := mesh.texcoords[i1];
+            uv2 := mesh.texcoords[i2];
+            tuv := (1.0 - u - v) * uv0 + u * uv1 + v * uv2;
+            uv = .{tuv.x, tuv.y};
+
+            du1 := uv1.x - uv0.x;
+            du2 := uv2.x - uv0.x;
+            dv1 := uv1.y - uv0.y;
+            dv2 := uv2.y - uv0.y;
+            determinant := du1 * dv2 - dv1 * du2;
+            if abs(determinant) > cast(float) 1.0e-8 {
+                inv_det_uv := 1.0 / determinant;
+                dpdu = ( dv2 * e1 - dv1 * e2) * inv_det_uv;
+            }
+        }
+        if length(dpdu) == 0.0 dpdu = e1;
+
+        p_hit := p0 + u * e1 + v * e2;
+        p_error := gamma(7) * (abs_v3(p0) + abs_v3(u * e1) + abs_v3(v * e2));
+        closest = t;
+        found = true;
+        closest_si = .{
+            t,
+            .{
+                p_hit,
+                p_error,
+                n,
+                dpdu,
+                uv,
+                mesh.material_index,
+            },
+        };
+    }
+
+    return found, closest_si;
 }
 
 intersect :: (scene: *Scene, ray: Ray, t_max: float = cast(float) 1000000000) -> hit: bool, si: Shape_Intersection {
@@ -855,6 +998,16 @@ intersect :: (scene: *Scene, ray: Ray, t_max: float = cast(float) 1000000000) ->
         }
     }
 
+    for *mesh: scene.triangle_meshes {
+        h, candidate := intersect_triangle_mesh(mesh, ray, closest);
+        if h {
+            found = true;
+            closest = candidate.t_hit;
+            closest_si = candidate;
+        }
+    }
+
+    if found apply_material_normal_map(scene, *closest_si.intr);
     return found, closest_si;
 }
 
@@ -864,12 +1017,71 @@ surface_emission :: (scene: *Scene, intr: *Surface_Interaction, wo: Vector3) -> 
     return .{};
 }
 
+sample_image_texture :: (texture: *Image_Texture, uv: Point2) -> Vector3 {
+    if texture.width <= 0 || texture.height <= 0 || texture.pixels.count == 0 return texture.scale;
+
+    u := uv.x - floor(uv.x);
+    v := uv.y - floor(uv.y);
+    v = 1.0 - v;
+
+    fx := u * cast(float) (texture.width - 1);
+    fy := v * cast(float) (texture.height - 1);
+    x := clamp(cast(int) floor(fx + 0.5), 0, texture.width - 1);
+    y := clamp(cast(int) floor(fy + 0.5), 0, texture.height - 1);
+    offset := (x + y * texture.width) * 4;
+
+    rgb := Vector3.{
+        cast(float) texture.pixels[offset + 0] / 255.0,
+        cast(float) texture.pixels[offset + 1] / 255.0,
+        cast(float) texture.pixels[offset + 2] / 255.0,
+    };
+
+    return hadamard(rgb, texture.scale);
+}
+
+apply_material_normal_map :: (scene: *Scene, intr: *Surface_Interaction) {
+    if intr.material_index < 0 || intr.material_index >= scene.materials.count return;
+
+    material := scene.materials[intr.material_index];
+    if material.normalmap_texture_index < 0 || material.normalmap_texture_index >= scene.textures.count return;
+
+    map_rgb := sample_image_texture(*scene.textures[material.normalmap_texture_index], intr.uv);
+    local_n := normalize(Vector3.{
+        2.0 * map_rgb.x - 1.0,
+        2.0 * map_rgb.y - 1.0,
+        2.0 * map_rgb.z - 1.0,
+    });
+    if length(local_n) == 0.0 return;
+
+    tangent := intr.dpdu - intr.n * dot(intr.n, intr.dpdu);
+    if length(tangent) == 0.0 {
+        tangent, _ = coordinate_system_from_z(intr.n);
+    } else {
+        tangent = normalize(tangent);
+    }
+
+    bitangent := normalize(cross(intr.n, tangent));
+    shading_n := normalize(local_n.x * tangent + local_n.y * bitangent + local_n.z * intr.n);
+    if length(shading_n) == 0.0 return;
+    intr.n = shading_n;
+}
+
+material_sampled_albedo :: (scene: *Scene, material: *Material, uv: Point2) -> Sampled_Spectrum {
+    if material.reflectance_texture_index >= 0 && material.reflectance_texture_index < scene.textures.count {
+        rgb := sample_image_texture(*scene.textures[material.reflectance_texture_index], uv);
+        return rgb_to_sampled_spectrum(rgb);
+    }
+
+    return material.sampled_albedo;
+}
+
 bsdf_f :: (scene: *Scene, intr: *Surface_Interaction, wo: Vector3, wi: Vector3) -> Sampled_Spectrum {
     if dot(wi, intr.n) <= 0.0 return .{};
 
-    material := scene.materials[intr.material_index];
-    if material.type == .LAMBERTIAN return spectrum_scale(material.sampled_albedo, INV_PI);
-    if material.type == .EMISSIVE return spectrum_scale(material.sampled_albedo, INV_PI);
+    material := *scene.materials[intr.material_index];
+    albedo := material_sampled_albedo(scene, material, intr.uv);
+    if material.type == .LAMBERTIAN return spectrum_scale(albedo, INV_PI);
+    if material.type == .EMISSIVE return spectrum_scale(albedo, INV_PI);
     if material.type == .INTERFACE return .{};
 
     return .{};

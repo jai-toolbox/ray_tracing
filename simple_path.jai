@@ -142,6 +142,60 @@ sample_infinite_light :: (scene: *Scene, intr: *Surface_Interaction, u: Point2) 
     return .{scene.sampled_infinite_light, wi, UNIFORM_SPHERE_PDF, intr.p + wi * cast(float) 2000000.0, false}, true;
 }
 
+spot_light_falloff :: (light: *Point_Spot_Light, w_light_to_point: Vector3) -> float {
+    if !light.is_spot return 1.0;
+
+    cos_theta := dot(light.direction, normalize(w_light_to_point));
+    if cos_theta < light.cos_total_width return 0.0;
+    if cos_theta > light.cos_falloff_start return 1.0;
+
+    delta := (cos_theta - light.cos_total_width) / (light.cos_falloff_start - light.cos_total_width);
+    return delta * delta * delta * delta;
+}
+
+sample_point_spot_light :: (scene: *Scene, intr: *Surface_Interaction, light: *Point_Spot_Light) -> Light_Li_Sample, bool {
+    to_light := light.position - intr.p;
+    distance_squared := dot(to_light, to_light);
+    if distance_squared <= 0.0 return .{}, false;
+
+    wi := normalize(to_light);
+    falloff := spot_light_falloff(light, -wi);
+    if falloff <= 0.0 return .{}, false;
+
+    L := spectrum_scale(light.sampled_intensity, falloff / distance_squared);
+    return .{L, wi, 1.0, light.position, true}, true;
+}
+
+direct_light_count :: (scene: *Scene, include_infinite: bool = true) -> int {
+    count := scene.point_spot_lights.count;
+    if find_emissive_sphere(scene) != null count += 1;
+    if include_infinite && !spectrum_is_zero(scene.sampled_infinite_light) count += 1;
+    return count;
+}
+
+sample_direct_light_by_index :: (scene: *Scene, intr: *Surface_Interaction, index: int, u: Point2, include_infinite: bool = true) -> Light_Li_Sample, bool {
+    if index < scene.point_spot_lights.count {
+        ls, ok := sample_point_spot_light(scene, intr, *scene.point_spot_lights[index]);
+        return ls, ok;
+    }
+    index -= scene.point_spot_lights.count;
+
+    emissive_sphere := find_emissive_sphere(scene);
+    if emissive_sphere != null {
+        if index == 0 {
+            ls, ok := sample_emissive_sphere_light(scene, intr, emissive_sphere, u);
+            return ls, ok;
+        }
+        index -= 1;
+    }
+
+    if include_infinite && index == 0 {
+        ls, ok := sample_infinite_light(scene, intr, u);
+        return ls, ok;
+    }
+    return .{}, false;
+}
+
 unoccluded :: (scene: *Scene, intr: *Surface_Interaction, ls: *Light_Li_Sample) -> bool {
     shadow_ray := spawn_ray(intr, ls.wi);
     t_max := cast(float) 1000000000;
@@ -163,21 +217,15 @@ unoccluded :: (scene: *Scene, intr: *Surface_Interaction, ls: *Light_Li_Sample) 
 }
 
 sample_direct_light :: (using integrator: *Simple_Path_Integrator, intr: *Surface_Interaction, wo: Vector3, beta: Sampled_Spectrum) -> Sampled_Spectrum {
-    emissive_sphere := find_emissive_sphere(scene);
-    if emissive_sphere == null return .{};
+    light_count := direct_light_count(scene, include_infinite = true);
+    if light_count == 0 return .{};
 
     uc := get_1d(*sampler);
     u := get_2d(*sampler);
-    light_p := cast(float) 0.5;
+    index := min(cast(int) floor(uc * cast(float) light_count), light_count - 1);
+    light_p := 1.0 / cast(float) light_count;
 
-    ls: Light_Li_Sample;
-    ok := false;
-    if uc < 0.5 {
-        ls, ok = sample_emissive_sphere_light(scene, intr, emissive_sphere, u);
-    } else {
-        ls, ok = sample_infinite_light(scene, intr, u);
-    }
-
+    ls, ok := sample_direct_light_by_index(scene, intr, index, u, include_infinite = true);
     if !ok || ls.pdf <= 0.0 || spectrum_is_zero(ls.L) return .{};
 
     fcos := spectrum_scale(bsdf_f(scene, intr, wo, ls.wi), abs(dot(ls.wi, intr.n)));

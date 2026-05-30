@@ -193,6 +193,46 @@ render_cli_vol_path_explosion_tev :: (title: string = "jai_vol_path_explosion.ex
     return tev_display_item_display(*display_item, *connection, *integrator.film);
 }
 
+render_imported_pbrt_scene_ppm :: (imported: *Pbrt_Imported_Scene, filename: string,
+                                   samples_per_pixel: int = 0,
+                                   disable_pixel_jitter := false) {
+    spp := ifx samples_per_pixel > 0 then samples_per_pixel else imported.samples_per_pixel;
+    integrator := make_path_integrator(*imported.scene, imported.camera, imported.width, imported.height,
+                                       max(1, spp), imported.max_depth, disable_pixel_jitter);
+    render(*integrator);
+    ok := write_ppm(*integrator.film, filename);
+    assert(ok, "Failed to write image '%'.", filename);
+}
+
+render_imported_pbrt_scene_tev :: (imported: *Pbrt_Imported_Scene, address: string,
+                                   samples_per_pixel: int = 0,
+                                   disable_pixel_jitter := false) -> bool {
+    spp := ifx samples_per_pixel > 0 then samples_per_pixel else imported.samples_per_pixel;
+    integrator := make_path_integrator(*imported.scene, imported.camera, imported.width, imported.height,
+                                       max(1, spp), imported.max_depth, disable_pixel_jitter);
+
+    connection := tev_connect(address);
+    if !connection.connected return false;
+    defer tev_disconnect(*connection);
+
+    title := ifx imported.output_filename then imported.output_filename else "jai_pbrt_import.exr";
+    display_item := make_tev_display_item(title, imported.width, imported.height);
+    defer free_tev_display_item(*display_item);
+
+    if !tev_display_item_display(*display_item, *connection, *integrator.film) return false;
+
+    for sample_index: 0..integrator.sampler.samples_per_pixel-1 {
+        for y: 0..integrator.film.height-1 {
+            for x: 0..integrator.film.width-1 {
+                evaluate_pixel_sample(*integrator, .{x, y}, sample_index);
+            }
+            if !tev_display_item_display(*display_item, *connection, *integrator.film) return false;
+        }
+    }
+
+    return tev_display_item_display(*display_item, *connection, *integrator.film);
+}
+
 run_ray_tracing_cli :: () {
     raw_args := get_command_line_arguments();
     defer array_reset(*raw_args);
@@ -224,11 +264,30 @@ run_ray_tracing_cli :: (raw_args: [] string) {
         return;
     }
 
-    ray_tracing_cli_warn_if_unsupported_options_are_set(is_set, free_arguments, options.quiet);
+    ray_tracing_cli_warn_if_unsupported_options_are_set(is_set, .[], options.quiet);
+
+    samples_per_pixel := ifx is_set.spp then max(1, options.spp) else 1;
+
+    if free_arguments.count > 0 {
+        imported, ok_import := pbrt_load_scene(free_arguments[0]);
+        assert(ok_import, "Failed to import PBRT scene '%'.", free_arguments[0]);
+        defer free_scene(*imported.scene);
+
+        if options.display_server {
+            ok := render_imported_pbrt_scene_tev(*imported, options.display_server,
+                                                 samples_per_pixel, options.disable_pixel_jitter);
+            assert(ok, "Failed to send render to display server at '%'.", options.display_server);
+            return;
+        }
+
+        output := ifx options.outfile then options.outfile else imported.output_filename;
+        render_imported_pbrt_scene_ppm(*imported, output, samples_per_pixel, options.disable_pixel_jitter);
+        if !options.quiet print("Wrote %\n", output);
+        return;
+    }
 
     width := 320;
     height := 180;
-    samples_per_pixel := ifx is_set.spp then max(1, options.spp) else 1;
 
     if options.display_server {
         ok := render_cli_vol_path_explosion_tev("jai_vol_path_explosion.exr", options.display_server,

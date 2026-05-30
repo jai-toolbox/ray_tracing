@@ -53,21 +53,20 @@ sphere_light_pdf_li :: (ctx_intr: *Surface_Interaction, sphere: *Sphere, wi: Vec
 }
 
 sample_path_direct_light :: (using integrator: *Path_Integrator, intr: *Surface_Interaction, wo: Vector3) -> Sampled_Spectrum {
-    emissive_sphere := find_emissive_sphere(scene);
-    if emissive_sphere == null return .{};
+    light_count := direct_light_count(scene, include_infinite = false);
+    if light_count == 0 return .{};
 
     uc := get_1d(*sampler);
     u_light := get_2d(*sampler);
-    light_p := cast(float) 0.5;
+    index := min(cast(int) floor(uc * cast(float) light_count), light_count - 1);
+    light_p := 1.0 / cast(float) light_count;
 
     // PBRT path tracing asks lights for an incomplete PDF. Uniform infinite
     // lights return no direct-light sample in that mode, though the samples
     // are still consumed.
-    if uc >= 0.5 return .{};
-
     light_context_intr := intr.*;
     light_context_intr.p = spawn_ray(intr, wo).origin;
-    ls, ok := sample_emissive_sphere_light(scene, *light_context_intr, emissive_sphere, u_light);
+    ls, ok := sample_direct_light_by_index(scene, *light_context_intr, index, u_light, include_infinite = false);
     if !ok || ls.pdf <= 0.0 || spectrum_is_zero(ls.L) return .{};
 
     fcos := spectrum_scale(bsdf_f(scene, intr, wo, ls.wi), abs(dot(ls.wi, intr.n)));
