@@ -40,7 +40,7 @@ INV_PI :: cast(float) 1.0 / PI;
 UNIFORM_SPHERE_PDF :: cast(float) 1.0 / (cast(float) 4.0 * PI);
 MACHINE_EPSILON :: cast(float) 0.000000059604644775390625;
 RAY_T_MIN :: cast(float) 0.0001;
-SPHERE_PERROR_GAMMA_N :: cast(float) 6.1466969;
+SPHERE_PERROR_GAMMA_N :: cast(float) 5.0;
 
 Point2 :: struct {
     x, y: float;
@@ -54,6 +54,7 @@ Ray :: struct {
     origin: Vector3;
     direction: Vector3;
     origin_error: Vector3;
+    medium_index: int = -1;
 }
 
 Camera_Sample :: struct {
@@ -103,6 +104,7 @@ Sampler :: struct {
 Material_Type :: enum {
     LAMBERTIAN;
     EMISSIVE;
+    INTERFACE;
 }
 
 Material :: struct {
@@ -111,6 +113,8 @@ Material :: struct {
     sampled_albedo: Sampled_Spectrum = .{0.8, 0.8, 0.8, 0.8};
     emission: Vector3;
     sampled_emission: Sampled_Spectrum;
+    inside_medium_index: int = -1;
+    outside_medium_index: int = -1;
 }
 
 Sphere :: struct {
@@ -123,6 +127,7 @@ Surface_Interaction :: struct {
     p: Vector3; 
     p_error: Vector3;
     n: Vector3;
+    dpdu: Vector3;
     material_index: int;
 }
 
@@ -138,8 +143,54 @@ Interval :: struct {
 Scene :: struct {
     spheres: [..] Sphere;
     materials: [..] Material;
+    media: [..] Medium;
     infinite_light: Vector3 = .{0.02, 0.025, 0.04};
     sampled_infinite_light: Sampled_Spectrum = .{0.02, 0.025, 0.04, 0.04};
+}
+
+Medium :: struct {
+    type: Medium_Type = .HOMOGENEOUS;
+    sigma_a: Sampled_Spectrum;
+    sigma_s: Sampled_Spectrum;
+    Le: Sampled_Spectrum;
+    g: float = 0.0;
+    Le_scale: float = 1.0;
+    temperature_offset: float = 0.0;
+    temperature_scale: float = 1.0;
+    volume: Dense_Volume;
+}
+
+Medium_Properties :: struct {
+    sigma_a: Sampled_Spectrum;
+    sigma_s: Sampled_Spectrum;
+    Le: Sampled_Spectrum;
+    g: float;
+}
+
+Medium_Type :: enum {
+    HOMOGENEOUS;
+    DENSE_NANOVDB;
+}
+
+Dense_Volume :: struct {
+    nx, ny, nz: int;
+    min_x, min_y, min_z: int;
+    max_x, max_y, max_z: int;
+    world_min: Vector3;
+    world_max: Vector3;
+    density_min_x, density_min_y, density_min_z: int;
+    density_max_x, density_max_y, density_max_z: int;
+    temperature_min_x, temperature_min_y, temperature_min_z: int;
+    temperature_max_x, temperature_max_y, temperature_max_z: int;
+    density_world_min: Vector3;
+    density_world_max: Vector3;
+    temperature_world_min: Vector3;
+    temperature_world_max: Vector3;
+    max_density: float;
+    majorant_res: int = 64;
+    majorants: [] float;
+    density: [] float;
+    temperature: [] float;
 }
 
 Random_Walk_Integrator :: struct {
@@ -179,14 +230,18 @@ spectrum_div :: (a: Sampled_Spectrum, s: float) -> Sampled_Spectrum {
     return .{a.x0 / s, a.x1 / s, a.x2 / s, a.x3 / s};
 }
 
+spectrum_first_component :: (a: Sampled_Spectrum) -> float {
+    return a.x0;
+}
+
 spectrum_is_zero :: (a: Sampled_Spectrum) -> bool {
     return a.x0 == 0.0 && a.x1 == 0.0 && a.x2 == 0.0 && a.x3 == 0.0;
 }
 
 spectrum_to_preview_rgb :: (s: Sampled_Spectrum) -> Vector3 {
-    r := s.x0 * cast(float) -19.5195503 + s.x1 * cast(float) 198.160538 + s.x2 * cast(float) 0.00367876096 + s.x3 * cast(float) -22.2260914;
-    g := s.x0 * cast(float)  94.4784241 + s.x1 * cast(float) -8.36080456 + s.x2 * cast(float) -0.00039975351 + s.x3 * cast(float) 13.9654284;
-    b := s.x0 * cast(float) -10.6283808 + s.x1 * cast(float) -2.96292305 + s.x2 * cast(float) -0.0000247055796 + s.x3 * cast(float) 66.7974014;
+    r := s.x0 * cast(float) -18.7955990 + s.x1 * cast(float) 178.938019 + s.x2 * cast(float) 5.46126032 + s.x3 * cast(float) -19.9902992;
+    g := s.x0 * cast(float)  80.5008392 + s.x1 * cast(float) -3.86856723 + s.x2 * cast(float) 1.53463650 + s.x3 * cast(float) 16.1463814;
+    b := s.x0 * cast(float) -22.8443317 + s.x1 * cast(float) 4.63729858 + s.x2 * cast(float) 2.95837569 + s.x3 * cast(float) 125.488960;
     return .{r, g, b};
 }
 
@@ -504,6 +559,27 @@ murmur_hash64a_p2_seed :: (p: Point2i, seed: int) -> u64 {
     return h;
 }
 
+murmur_hash64a_u32 :: (value: u32, seed: u64 = 0) -> u64 {
+    m :: cast(u64) 0xc6a4a7935bd1e995;
+    r :: 47;
+
+    h := seed ^ (cast(u64) 4 * m);
+    h ^= cast(u64) (value & 0xff);
+    h ^= cast(u64) ((value >> 8) & 0xff) << 8;
+    h ^= cast(u64) ((value >> 16) & 0xff) << 16;
+    h ^= cast(u64) ((value >> 24) & 0xff) << 24;
+    h *= m;
+
+    h ^= h >> r;
+    h *= m;
+    h ^= h >> r;
+    return h;
+}
+
+hash_float_pbrt :: (value: float) -> u64 {
+    return murmur_hash64a_u32(float_bits(value), 0);
+}
+
 mix_bits :: (v: u64) -> u64 {
     v ^= v >> 31;
     v *= cast(u64) 0x7fb5d329728ea185;
@@ -581,7 +657,7 @@ look_at_camera :: (origin: Vector3, look_at: Vector3, up: Vector3,
                      inv_tan_fov_over_2: float = 1.0) -> Pinhole_Camera {
     camera: Pinhole_Camera;
     camera.origin = origin;
-    camera.origin_error = .{0, gamma(3) * abs(origin.y), gamma(3) * abs(origin.z)};
+    camera.origin_error = .{0, gamma(4) * abs(origin.y), gamma(4) * abs(origin.z)};
     dir := normalize(look_at - origin);
     camera.u = normalize(cross(normalize(up), dir));
     camera.v = cross(dir, camera.u);
@@ -629,7 +705,7 @@ generate_ray :: (using camera: *Pinhole_Camera, sample: Camera_Sample, film: *Fi
         ray_origin += direction * dt;
     }
 
-    return .{.{ray_origin, direction, origin_error}, .{1, 1, 1, 1}};
+    return .{.{ray_origin, direction, origin_error, -1}, .{1, 1, 1, 1}};
 }
 
 
@@ -675,7 +751,7 @@ spawn_ray :: (intr: *Surface_Interaction, direction: Vector3) -> Ray {
     else if offset.z < 0.0 origin.z = next_float_down(origin.z);
 
     origin_error := intr.p_error + abs_v3(offset);
-    return .{origin, normalize(direction), origin_error};
+    return .{origin, normalize(direction), origin_error, -1};
 }
 
 intersect_sphere :: (sphere: *Sphere, ray: Ray, t_max: float) -> hit: bool, si: Shape_Intersection {
@@ -750,13 +826,16 @@ intersect_sphere :: (sphere: *Sphere, ray: Ray, t_max: float) -> hit: bool, si: 
     local_scale := sphere.radius / local_length;
     local_p *= local_scale;
     p := sphere.center + local_p;
-    p_error := gamma_fractional(SPHERE_PERROR_GAMMA_N) * abs_v3(local_p) + gamma(3) * (abs_v3(local_p) + abs_v3(sphere.center));
+    p_error := gamma_fractional(SPHERE_PERROR_GAMMA_N) * abs_v3(local_p);
+    phi_max := cast(float) 2.0 * PI;
+    dpdu := Vector3.{-phi_max * local_p.y, phi_max * local_p.x, 0.0};
     return true, .{
         root,
         .{
             p,
             p_error,
             normalize(local_p),
+            dpdu,
             sphere.material_index,
         },
     };
@@ -791,6 +870,7 @@ bsdf_f :: (scene: *Scene, intr: *Surface_Interaction, wo: Vector3, wi: Vector3) 
     material := scene.materials[intr.material_index];
     if material.type == .LAMBERTIAN return spectrum_scale(material.sampled_albedo, INV_PI);
     if material.type == .EMISSIVE return spectrum_scale(material.sampled_albedo, INV_PI);
+    if material.type == .INTERFACE return .{};
 
     return .{};
 }
